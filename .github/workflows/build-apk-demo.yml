@@ -10,11 +10,11 @@ on:
       version_name:
         description: 'Version name Demo (mis. 1.0.0)'
         required: false
-        default: '1.0.9'
+        default: '1.0.10'
       version_code:
         description: 'Version code Demo (angka)'
         required: false
-        default: '10'
+        default: '11'
       website_url:
         description: 'URL website yang dibungkus WebView'
         required: false
@@ -26,7 +26,7 @@ on:
       release_tag:
         description: 'Tag GitHub Release Demo'
         required: false
-        default: 'demo-v1.0.9-manual'
+        default: 'demo-v1.0.10-manual'
 
 permissions:
   contents: write
@@ -41,7 +41,6 @@ env:
     -Dorg.gradle.parallel=true
     -Dorg.gradle.caching=true
     -Dorg.gradle.configuration-cache=false
-    -Dorg.gradle.workers.max=4
     -Dfile.encoding=UTF-8
   JAVA_TOOL_OPTIONS: -Xmx3072m
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -49,7 +48,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -93,22 +92,6 @@ jobs:
           packages: 'platforms;android-34 build-tools;34.0.0 platform-tools'
           log-accepted-android-sdk-licenses: false
           accept-android-sdk-licenses: true
-
-      # ── Gradle: provides `gradle` on PATH + auto-caches the Gradle
-      #    distribution AND all downloaded dependencies (~/.gradle/caches).
-      #    This eliminates the per-build Gradle download (~100MB) and the
-      #    AGP/AndroidX/dependency downloads — the single biggest build-time
-      #    win. Cache is keyed on gradle/wrapper + *.gradle files.
-      - name: Setup Gradle 8.2 with dependency cache
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.2'
-          cache-read-only: false
-          gradle-home-cache-cleanup: true
-          gradle-home-cache-includes: |
-            caches
-            notifications
-            wrapper
 
       - name: Generate Android project
         run: |
@@ -203,6 +186,46 @@ jobs:
           find app/src/main/java -type f | sort
           echo "Project OK"
 
+      # ── Manual Gradle install with retry (matches the proven Resmi workflow).
+      #    We intentionally do NOT use gradle/actions/setup-gradle@v3 here:
+      #    its dependency-cache restore can surface a corrupt/partial cache
+      #    from a prior run, which makes Gradle skip re-downloading deps it
+      #    believes are already present — the exact "gagal unduh dependency"
+      #    failure this step replaces. A fresh manual install + per-build
+      #    dependency download is slower but deterministic and reliable.
+      - name: Install Gradle 8.2 (with download retry)
+        run: |
+          set -euo pipefail
+          GRADLE_VER=8.2
+          GRADLE_URL="https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip"
+          # Retry the distribution download up to 4 times to survive transient
+          # network blips / CDN hiccups on GitHub Actions runners.
+          for attempt in 1 2 3 4; do
+            echo "Downloading Gradle ${GRADLE_VER} (attempt ${attempt}/4)..."
+            if curl -fsSL --connect-timeout 30 --max-time 300 -o /tmp/gradle.zip "$GRADLE_URL"; then
+              # Validate the zip is not empty / truncated
+              SIZE=$(stat -c%s /tmp/gradle.zip 2>/dev/null || stat -f%z /tmp/gradle.zip)
+              if [ "${SIZE}" -gt 1000000 ]; then
+                echo "Gradle distribution downloaded OK (${SIZE} bytes)"
+                break
+              fi
+              echo "::warning::Gradle zip too small (${SIZE} B) — retrying"
+              rm -f /tmp/gradle.zip
+            else
+              echo "::warning::Gradle download attempt ${attempt} failed"
+              rm -f /tmp/gradle.zip
+            fi
+            if [ "$attempt" = "4" ]; then
+              echo "::error::Failed to download Gradle ${GRADLE_VER} after 4 attempts"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+          sudo unzip -q /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-${GRADLE_VER}/bin" >> "$GITHUB_PATH"
+          export PATH="/opt/gradle-${GRADLE_VER}/bin:$PATH"
+          gradle --version
+
       - name: Prepare stable release keystore
         run: |
           set -euo pipefail
@@ -248,8 +271,16 @@ jobs:
             base64 -d release.keystore.b64 > release.keystore
           fi
 
-          # Generate wrapper once (Gradle distribution is served from the
-          # setup-gradle cache — no re-download).
+          # Purge any stale Gradle cache left by the runner image so the
+          # build always resolves dependencies from a clean state. This is
+          # the cache-corruption guard: if a previous job on the same runner
+          # wrote a partial module file, we never see it.
+          rm -rf ~/.gradle/caches/transforms-* \
+                 ~/.gradle/caches/modules-* \
+                 ~/.gradle/caches/8.2 \
+                 ~/.gradle/caches/8.2.2 2>/dev/null || true
+
+          # Generate wrapper once from the manually-installed Gradle.
           gradle wrapper --gradle-version 8.2 --no-daemon
           chmod +x gradlew
           test -f gradle/wrapper/gradle-wrapper.jar
@@ -265,6 +296,13 @@ jobs:
             echo 'android.useAndroidX=true'
             echo 'android.nonTransitiveRClass=true'
             echo 'android.builder.sdkDownload=false'
+            # ── Network resilience for dependency downloads ──
+            # Longer connect/socket timeouts so a slow mirror doesn't abort,
+            # and HTTP retry so a single dropped packet doesn't fail the build.
+            echo 'systemProp.org.gradle.internal.http.connectionTimeout=120000'
+            echo 'systemProp.org.gradle.internal.http.socketTimeout=120000'
+            echo 'systemProp.org.gradle.internal.repository.max.retries=3'
+            echo 'systemProp.org.gradle.internal.publish.checksums=false'
           } > gradle.properties
 
           dump_errors() {
@@ -301,10 +339,47 @@ jobs:
             return "$rc"
           }
 
+          # ── Dependency warm-up with retry ──
+          # Resolve all dependencies BEFORE the real build so a network
+          # failure surfaces here (with a retry) instead of mid-build. If the
+          # first resolution fails, purge the module cache and retry with
+          # --refresh-dependencies to force a clean re-download.
+          warm_deps() {
+            local label="$1"
+            shift
+            echo "=== Dependency warm-up: ${label} ==="
+            set +e
+            ./gradlew "$@" \
+              --no-daemon \
+              --console=plain \
+              2>&1 | tee "/tmp/dep-${label}.log"
+            local rc=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              echo "::warning::Dependency warm-up (${label}) failed"
+              grep -nE 'Could not (resolve|download|find)|FAILURE:|What went wrong:|Connection|timed out|Unknown host' \
+                "/tmp/dep-${label}.log" | tail -n 30 || true
+            fi
+            return "$rc"
+          }
+
+          if ! warm_deps first dependencies --configuration releaseRuntimeClasspath; then
+            echo "--- First warm-up failed; purging module cache + --refresh-dependencies ---"
+            rm -rf ~/.gradle/caches/modules-* 2>/dev/null || true
+            # Second warm-up: force fresh download of every dependency.
+            if ! warm_deps refresh dependencies --configuration releaseRuntimeClasspath --refresh-dependencies; then
+              echo "::warning::Dependency warm-up still failing — proceeding to build (Gradle will retry downloads itself)"
+            fi
+          fi
+          echo "Dependency warm-up complete"
+
+          # First attempt: plain assembleRelease (keeps website logo mipmap PNGs)
           if ! build_once first assembleRelease; then
-            echo '--- First build failed; clean retry (preserve launcher icon) ---'
+            echo '--- First build failed; clean retry with --refresh-dependencies (bypass any corrupt cache) ---'
             ./gradlew --stop || true
             rm -rf app/build .gradle build
+            # Purge ALL downloaded modules so the retry re-fetches from scratch.
+            rm -rf ~/.gradle/caches/modules-* ~/.gradle/caches/transforms-* 2>/dev/null || true
 
             KEEP_PNG=0
             if ls app/src/main/res/mipmap-*/ic_launcher.png >/dev/null 2>&1; then
@@ -343,8 +418,10 @@ jobs:
                 -dname "CN=Android Debug,O=Android,C=US"
             fi
 
-            if ! build_once retry clean assembleRelease; then
-              echo "::error::assembleRelease failed after clean retry"
+            # Retry with --refresh-dependencies so Gradle ignores any cached
+            # module metadata/files and re-downloads everything fresh.
+            if ! build_once retry clean assembleRelease --refresh-dependencies; then
+              echo "::error::assembleRelease failed after clean retry with --refresh-dependencies"
               if [ -f /tmp/gradle-retry.log ]; then
                 echo "======== FULL FAILURE BLOCK ========"
                 awk '/FAILURE:/{p=1} p{print} /BUILD FAILED/{exit}' /tmp/gradle-retry.log || true
